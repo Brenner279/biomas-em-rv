@@ -58,6 +58,9 @@ jobs:
 
           page = Path("www/index.html")
           html = page.read_text(encoding="utf-8")
+          # A interface Android é usada apenas pelos dois botões que devem abrir o Chrome.
+          if "window.BRASIL_IMERSIVO_APK = true;" not in html:
+              html = html.replace("<head>", "<head>\\n  <script>window.BRASIL_IMERSIVO_APK = true;</script>", 1)
           polyfill_cdn = "https://cdn.jsdelivr.net/npm/webxr-polyfill@2.0.3/build/webxr-polyfill.min.js"
           if polyfill_cdn not in html:
               raise SystemExit("A referência ao WebXR Polyfill 2.0.3 não foi encontrada.")
@@ -98,6 +101,10 @@ jobs:
               "cardboard: true",
               "DPDB_URL: null",
               "CARDBOARD_UI_DISABLED: false",
+              "window.BRASIL_IMERSIVO_APK = true;",
+              "AndroidVrLauncher.open(\"panorama\",current)",
+              "AndroidVrLauncher.open(\"fauna\",current)",
+              "chromeVrParams.get(\"chromeVR\")==\"1\"",
               'vr-mode-ui="enabled: true"',
           ]
           for token in required:
@@ -129,6 +136,435 @@ jobs:
 
       - name: Criar projeto Android
         run: npx cap add android
+
+      - name: Integrar servidor offline e abertura do Chrome
+        run: |
+          JAVA_DIR=android/app/src/main/java/com/michelbrenner/brasilimersivo
+          mkdir -p "$JAVA_DIR"
+
+          cat > "$JAVA_DIR/MainActivity.java" <<'JAVA'
+          package com.michelbrenner.brasilimersivo;
+
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  WebView webView = getBridge().getWebView();
+                  OfflineVrServer server = new OfflineVrServer(this);
+                  webView.addJavascriptInterface(
+                      new AndroidVrLauncher(this, server),
+                      "AndroidVrLauncher"
+                  );
+                  // Recarrega para disponibilizar a ponte antes dos scripts do projeto.
+                  webView.reload();
+              }
+          }
+          JAVA
+
+          cat > "$JAVA_DIR/AndroidVrLauncher.java" <<'JAVA'
+          package com.michelbrenner.brasilimersivo;
+
+          import android.app.Activity;
+          import android.content.ActivityNotFoundException;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.webkit.JavascriptInterface;
+          import android.widget.Toast;
+
+          import java.net.URLEncoder;
+          import java.nio.charset.StandardCharsets;
+
+          public final class AndroidVrLauncher {
+              private final Activity activity;
+              private final OfflineVrServer server;
+
+              public AndroidVrLauncher(Activity activity, OfflineVrServer server) {
+                  this.activity = activity;
+                  this.server = server;
+              }
+
+              @JavascriptInterface
+              public void open(String mode, String biome) {
+                  if (!("panorama".equals(mode) || "fauna".equals(mode))) {
+                      showMessage("Modo VR inválido.");
+                      return;
+                  }
+                  if (!OfflineVrServer.isValidBiome(biome)) {
+                      showMessage("Bioma não reconhecido.");
+                      return;
+                  }
+
+                  try {
+                      String url = server.startAndBuildUrl(mode, biome);
+                      Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                      intent.addCategory(Intent.CATEGORY_BROWSABLE);
+                      intent.setPackage("com.android.chrome");
+                      activity.runOnUiThread(() -> {
+                          try {
+                              activity.startActivity(intent);
+                          } catch (ActivityNotFoundException error) {
+                              Toast.makeText(activity,
+                                  "Google Chrome não encontrado. Instale ou atualize o Chrome para abrir o modo VR.",
+                                  Toast.LENGTH_LONG).show();
+                          } catch (Exception error) {
+                              Toast.makeText(activity,
+                                  "Não foi possível abrir o Chrome: " + error.getMessage(),
+                                  Toast.LENGTH_LONG).show();
+                          }
+                      });
+                  } catch (Exception error) {
+                      showMessage("Não foi possível iniciar o servidor VR offline: " + error.getMessage());
+                  }
+              }
+
+              private void showMessage(String message) {
+                  activity.runOnUiThread(() ->
+                      Toast.makeText(activity, message, Toast.LENGTH_LONG).show()
+                  );
+              }
+          }
+          JAVA
+
+          cat > "$JAVA_DIR/OfflineVrServer.java" <<'JAVA'
+          package com.michelbrenner.brasilimersivo;
+
+          import android.content.Context;
+          import android.content.res.AssetManager;
+
+          import java.io.BufferedOutputStream;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.io.RandomAccessFile;
+          import java.net.InetAddress;
+          import java.net.InetSocketAddress;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+          import java.net.URLDecoder;
+          import java.nio.charset.StandardCharsets;
+          import java.util.HashMap;
+          import java.util.Locale;
+          import java.util.Map;
+
+          /**
+           * Servidor HTTP limitado ao loopback do próprio aparelho.
+           * O Chrome acessa os mesmos arquivos que foram empacotados no APK.
+           */
+          public final class OfflineVrServer {
+              private final Context context;
+              private final Object startLock = new Object();
+              private final Object extractLock = new Object();
+              private volatile ServerSocket serverSocket;
+              private volatile int port;
+              private volatile boolean running;
+
+              private static final String CACHE_DIR = "brasil-imersivo-chrome-v1";
+
+              public OfflineVrServer(Context context) {
+                  this.context = context.getApplicationContext();
+              }
+
+              public static boolean isValidBiome(String biome) {
+                  return "amazonia".equals(biome) ||
+                      "cerrado".equals(biome) ||
+                      "caatinga".equals(biome) ||
+                      "mata-atlantica".equals(biome) ||
+                      "pantanal".equals(biome) ||
+                      "pampa".equals(biome);
+              }
+
+              public String startAndBuildUrl(String mode, String biome) throws IOException {
+                  ensureStarted();
+                  String safeMode = "fauna".equals(mode) ? "fauna" : "panorama";
+                  String safeBiome = biome;
+                  return "http://127.0.0.1:" + port +
+                      "/index.html?chromeVR=1&mode=" + safeMode + "&biome=" + safeBiome;
+              }
+
+              private void ensureStarted() throws IOException {
+                  synchronized (startLock) {
+                      if (running && serverSocket != null && !serverSocket.isClosed()) return;
+
+                      ServerSocket socket = new ServerSocket();
+                      socket.setReuseAddress(true);
+                      socket.bind(new InetSocketAddress(
+                          InetAddress.getByName("127.0.0.1"), 0
+                      ));
+                      serverSocket = socket;
+                      port = socket.getLocalPort();
+                      running = true;
+
+                      Thread worker = new Thread(() -> acceptLoop(socket), "BrasilImersivo-HTTP");
+                      worker.setDaemon(true);
+                      worker.start();
+                  }
+              }
+
+              private void acceptLoop(ServerSocket socket) {
+                  while (running && !socket.isClosed()) {
+                      try {
+                          Socket client = socket.accept();
+                          client.setSoTimeout(20000);
+                          Thread handler = new Thread(() -> handleClient(client),
+                              "BrasilImersivo-HTTP-Request");
+                          handler.setDaemon(true);
+                          handler.start();
+                      } catch (IOException error) {
+                          if (running && !socket.isClosed()) {
+                              android.util.Log.e("BrasilImersivo", "Falha no servidor local", error);
+                          }
+                      }
+                  }
+              }
+
+              private void handleClient(Socket client) {
+                  try (Socket socket = client;
+                       InputStream input = socket.getInputStream();
+                       OutputStream output = new BufferedOutputStream(socket.getOutputStream())) {
+
+                      String requestLine = readLine(input);
+                      if (requestLine == null || requestLine.trim().isEmpty()) return;
+                      String[] request = requestLine.split(" ");
+                      if (request.length < 2) {
+                          sendError(output, 400, "Bad Request");
+                          return;
+                      }
+                      String method = request[0].toUpperCase(Locale.ROOT);
+                      Map<String, String> headers = new HashMap<>();
+                      String line;
+                      while ((line = readLine(input)) != null && !line.isEmpty()) {
+                          int colon = line.indexOf(':');
+                          if (colon > 0) {
+                              headers.put(line.substring(0, colon).trim().toLowerCase(Locale.ROOT),
+                                  line.substring(colon + 1).trim());
+                          }
+                      }
+
+                      if ("OPTIONS".equals(method)) {
+                          writeHeaders(output, 204, "No Content", "text/plain", 0,
+                              "Access-Control-Allow-Origin: *\r\n" +
+                              "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n" +
+                              "Access-Control-Allow-Headers: Range, Content-Type\r\n");
+                          output.flush();
+                          return;
+                      }
+                      if (!"GET".equals(method) && !"HEAD".equals(method)) {
+                          sendError(output, 405, "Method Not Allowed");
+                          return;
+                      }
+
+                      String rawPath = request[1].split("\\?", 2)[0];
+                      String path = URLDecoder.decode(rawPath, "UTF-8");
+                      String relative = normalizePath(path);
+                      if (relative == null) {
+                          sendError(output, 403, "Forbidden");
+                          return;
+                      }
+
+                      String rangeHeader = headers.get("range");
+                      if (isStreamFile(relative)) {
+                          File file = materializeAsset(relative);
+                          serveFile(output, method, file, rangeHeader, mimeType(relative));
+                      } else {
+                          byte[] data = readAsset(relative);
+                          serveBytes(output, method, data, mimeType(relative));
+                      }
+                  } catch (Exception error) {
+                      android.util.Log.e("BrasilImersivo", "Erro ao servir conteúdo local", error);
+                  }
+              }
+
+              private String normalizePath(String path) {
+                  if (path == null || path.indexOf('\\\\') >= 0) return null;
+                  String value = path.startsWith("/") ? path.substring(1) : path;
+                  if (value.isEmpty()) value = "index.html";
+                  String[] parts = value.split("/");
+                  for (String part : parts) {
+                      if ("..".equals(part) || ".".equals(part) || part.isEmpty()) return null;
+                  }
+                  return value;
+              }
+
+              private String readLine(InputStream input) throws IOException {
+                  ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                  int value;
+                  while ((value = input.read()) != -1) {
+                      if (value == '\\n') {
+                          byte[] bytes = buffer.toByteArray();
+                          int length = bytes.length;
+                          if (length > 0 && bytes[length - 1] == '\\r') length--;
+                          return new String(bytes, 0, length, StandardCharsets.ISO_8859_1);
+                      }
+                      buffer.write(value);
+                      if (buffer.size() > 16384) throw new IOException("Cabeçalho HTTP muito longo.");
+                  }
+                  return buffer.size() == 0 ? null :
+                      new String(buffer.toByteArray(), StandardCharsets.ISO_8859_1);
+              }
+
+              private byte[] readAsset(String relative) throws IOException {
+                  try (InputStream input = context.getAssets().open("public/" + relative);
+                       ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+                      byte[] chunk = new byte[32768];
+                      int count;
+                      while ((count = input.read(chunk)) != -1) output.write(chunk, 0, count);
+                      return output.toByteArray();
+                  }
+              }
+
+              private File materializeAsset(String relative) throws IOException {
+                  File root = new File(context.getCacheDir(), CACHE_DIR);
+                  File target = new File(root, relative);
+                  String rootPath = root.getCanonicalPath() + File.separator;
+                  if (!target.getCanonicalPath().startsWith(rootPath)) {
+                      throw new IOException("Caminho inválido.");
+                  }
+                  synchronized (extractLock) {
+                      if (target.isFile() && target.length() > 0) return target;
+                      File parent = target.getParentFile();
+                      if (parent != null && !parent.exists() && !parent.mkdirs()) {
+                          throw new IOException("Não foi possível criar o cache de vídeo.");
+                      }
+                      File temporary = new File(target.getAbsolutePath() + ".part");
+                      try (InputStream input = context.getAssets().open("public/" + relative);
+                           OutputStream output = new java.io.FileOutputStream(temporary)) {
+                          byte[] chunk = new byte[65536];
+                          int count;
+                          while ((count = input.read(chunk)) != -1) output.write(chunk, 0, count);
+                      }
+                      if (target.exists() && !target.delete()) {
+                          temporary.delete();
+                          throw new IOException("Não foi possível atualizar o vídeo em cache.");
+                      }
+                      if (!temporary.renameTo(target)) {
+                          temporary.delete();
+                          throw new IOException("Não foi possível concluir o cache do vídeo.");
+                      }
+                      return target;
+                  }
+              }
+
+              private boolean isStreamFile(String path) {
+                  String lower = path.toLowerCase(Locale.ROOT);
+                  return lower.endsWith(".mp4") || lower.endsWith(".m4v") ||
+                      lower.endsWith(".mp3") || lower.endsWith(".webm") ||
+                      lower.endsWith(".wav") || lower.endsWith(".aac");
+              }
+
+              private String mimeType(String path) {
+                  String lower = path.toLowerCase(Locale.ROOT);
+                  if (lower.endsWith(".html")) return "text/html; charset=utf-8";
+                  if (lower.endsWith(".js")) return "application/javascript; charset=utf-8";
+                  if (lower.endsWith(".css")) return "text/css; charset=utf-8";
+                  if (lower.endsWith(".png")) return "image/png";
+                  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+                  if (lower.endsWith(".webp")) return "image/webp";
+                  if (lower.endsWith(".svg")) return "image/svg+xml";
+                  if (lower.endsWith(".json") || lower.endsWith(".webmanifest")) return "application/json";
+                  if (lower.endsWith(".mp4") || lower.endsWith(".m4v")) return "video/mp4";
+                  if (lower.endsWith(".mp3")) return "audio/mpeg";
+                  if (lower.endsWith(".webm")) return "video/webm";
+                  if (lower.endsWith(".wav")) return "audio/wav";
+                  if (lower.endsWith(".aac")) return "audio/aac";
+                  if (lower.endsWith(".ico")) return "image/x-icon";
+                  return "application/octet-stream";
+              }
+
+              private void serveBytes(OutputStream output, String method, byte[] data,
+                                      String contentType) throws IOException {
+                  writeHeaders(output, 200, "OK", contentType, data.length,
+                      "Cache-Control: no-cache\\r\\n");
+                  if (!"HEAD".equals(method)) output.write(data);
+                  output.flush();
+              }
+
+              private void serveFile(OutputStream output, String method, File file,
+                                     String rangeHeader, String contentType) throws IOException {
+                  long size = file.length();
+                  long start = 0;
+                  long end = size - 1;
+                  boolean partial = false;
+
+                  if (rangeHeader != null && rangeHeader.startsWith("bytes=") && size > 0) {
+                      String spec = rangeHeader.substring(6).split(",", 2)[0].trim();
+                      int dash = spec.indexOf('-');
+                      if (dash >= 0) {
+                          String first = spec.substring(0, dash).trim();
+                          String last = spec.substring(dash + 1).trim();
+                          try {
+                              if (first.isEmpty()) {
+                                  long suffix = Long.parseLong(last);
+                                  start = Math.max(0, size - suffix);
+                              } else {
+                                  start = Long.parseLong(first);
+                                  if (!last.isEmpty()) end = Math.min(size - 1, Long.parseLong(last));
+                              }
+                              if (start < 0 || start >= size || end < start) {
+                                  writeHeaders(output, 416, "Range Not Satisfiable", "text/plain", 0,
+                                      "Content-Range: bytes */" + size + "\\r\\n");
+                                  output.flush();
+                                  return;
+                              }
+                              partial = true;
+                          } catch (NumberFormatException ignored) {
+                              start = 0;
+                              end = size - 1;
+                          }
+                      }
+                  }
+
+                  long length = Math.max(0, end - start + 1);
+                  int status = partial ? 206 : 200;
+                  writeHeaders(output, status, partial ? "Partial Content" : "OK",
+                      contentType, length,
+                      "Accept-Ranges: bytes\\r\\n" +
+                      (partial ? "Content-Range: bytes " + start + "-" + end + "/" + size + "\\r\\n" : "") +
+                      "Cache-Control: no-cache\\r\\n");
+                  if (!"HEAD".equals(method) && length > 0) {
+                      try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
+                          input.seek(start);
+                          byte[] chunk = new byte[65536];
+                          long remaining = length;
+                          while (remaining > 0) {
+                              int count = input.read(chunk, 0, (int) Math.min(chunk.length, remaining));
+                              if (count == -1) break;
+                              output.write(chunk, 0, count);
+                              remaining -= count;
+                          }
+                      }
+                  }
+                  output.flush();
+              }
+
+              private void writeHeaders(OutputStream output, int status, String reason,
+                                        String contentType, long length, String extra)
+                  throws IOException {
+                  String headers = "HTTP/1.1 " + status + " " + reason + "\\r\\n" +
+                      "Content-Type: " + contentType + "\\r\\n" +
+                      "Content-Length: " + length + "\\r\\n" +
+                      "Connection: close\\r\\n" +
+                      "X-Content-Type-Options: nosniff\\r\\n" +
+                      "Access-Control-Allow-Origin: *\\r\\n" +
+                      "Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length\\r\\n" +
+                      extra + "\\r\\n";
+                  output.write(headers.getBytes(StandardCharsets.ISO_8859_1));
+              }
+
+              private void sendError(OutputStream output, int status, String reason) throws IOException {
+                  byte[] body = (reason + "\\n").getBytes(StandardCharsets.UTF_8);
+                  writeHeaders(output, status, reason, "text/plain; charset=utf-8", body.length, "");
+                  output.write(body);
+                  output.flush();
+              }
+          }
+          JAVA
 
       - name: Sincronizar aplicação
         run: npx cap sync android
