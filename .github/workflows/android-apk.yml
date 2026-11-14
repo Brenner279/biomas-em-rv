@@ -104,7 +104,7 @@ jobs:
               "window.BRASIL_IMERSIVO_APK = true;",
               "AndroidVrLauncher.open(\"panorama\",current)",
               "AndroidVrLauncher.open(\"fauna\",current)",
-              "chromeVrParams.get(\"chromeVR\")==\"1\"",
+              "chromeVrParams.get(\"chromeVR\")===\"1\"",
               'vr-mode-ui="enabled: true"',
           ]
           for token in required:
