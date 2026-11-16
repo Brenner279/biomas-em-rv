@@ -5,16 +5,26 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#102b27">
   <meta name="description" content="Explore os seis biomas brasileiros em uma experiência educativa de realidade virtual e ambientes 3D.">
+  <meta name="mobile-web-app-capable" content="yes">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="assets/offline-icon.svg" type="image/svg+xml">
   <title>Brasil Imersivo | Realidade Virtual </title>
-  <script src="https://cdn.jsdelivr.net/npm/webxr-polyfill@2.0.3/build/webxr-polyfill.min.js"></script>
+  <script src="vendor/webxr-polyfill.min.js"></script>
+  <script>
+    if (typeof window.WebXRPolyfill === "undefined") {
+      document.write('<script src="https://cdn.jsdelivr.net/npm/webxr-polyfill@2.0.3/build/webxr-polyfill.min.js"><\\/script>');
+    }
+  </script>
   <script>
     // Inicializar antes do A-Frame permite que ele detecte a compatibilidade Cardboard.
     window.webxrPolyfill = new WebXRPolyfill({ cardboard: true });
   </script>
-  <script src="https://aframe.io/releases/1.8.0/aframe.min.js"></script>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script src="vendor/aframe.min.js"></script>
+  <script>
+    if (typeof window.AFRAME === "undefined") {
+      document.write('<script src="https://aframe.io/releases/1.8.0/aframe.min.js"><\\/script>');
+    }
+  </script>
   <style>
     :root{--ink:#172923;--muted:#64756c;--paper:#f4f5ef;--green:#1f624b;--lime:#c6df91;--line:#dfe5dc}
     *{box-sizing:border-box} body{margin:0;background:var(--paper);color:var(--ink);font-family:"DM Sans",sans-serif}
@@ -127,6 +137,18 @@
     <p class="hero-desc">Explore o mapa, descubra as riquezas naturais de cada bioma e mergulhe em uma jornada educativa e interativa!</p>
   </section>
   <div class="cta-wrapper"><a href="#mapa-biomas" class="cta-btn">🧭 Selecione um dos Biomas do Mapa <span>❯</span></a></div>
+  <section class="offline-download" id="offline-download" aria-labelledby="offline-title">
+    <div class="offline-download-copy">
+      <span class="offline-download-icon" aria-hidden="true">↓</span>
+      <div>
+        <h2 id="offline-title">Preparar para usar sem internet</h2>
+        <p>Baixe panoramas, vídeos, imagens e bibliotecas no Chrome. São aproximadamente 180 MB.</p>
+      </div>
+    </div>
+    <button class="offline-download-button" id="prepare-offline" type="button" disabled>Preparar versão offline</button>
+    <progress id="offline-progress" max="37" value="0" hidden></progress>
+    <p class="offline-download-status" id="offline-status" role="status" aria-live="polite">Conecte-se à internet para preparar os arquivos uma única vez.</p>
+  </section>
   <section class="map-section" id="mapa-biomas">
     <article class="map-panel">
       <div class="panel-heading"><div><span class="section-kicker">ESCOLHA SEU DESTINO</span><h2>Explore o mapa do Brasil</h2></div><span class="map-hint">Toque em um bioma</span></div>
@@ -830,6 +852,100 @@
       }
     }
   
+
+    // Armazena todos os recursos no Chrome para permitir a exploração totalmente offline.
+    (function setupOfflinePreparation(){
+      const button=document.querySelector("#prepare-offline");
+      const status=document.querySelector("#offline-status");
+      const progress=document.querySelector("#offline-progress");
+      if(!button||!status||!progress)return;
+
+      if(!("serviceWorker" in navigator)){
+        status.textContent="Este navegador não oferece suporte ao armazenamento offline. Use uma versão recente do Chrome.";
+        return;
+      }
+      if(location.protocol!=="https:"&&location.hostname!=="localhost"&&location.hostname!=="127.0.0.1"){
+        status.textContent="Abra o projeto pelo endereço HTTPS do GitHub Pages para habilitar o modo offline.";
+        return;
+      }
+
+      let offlineRegistration=null;
+      const enableButton=()=>{
+        button.disabled=false;
+        status.textContent="Pronto para baixar os recursos. Faça isso enquanto estiver conectado ao Wi-Fi.";
+      };
+
+      (async()=>{
+        try{
+          offlineRegistration=await navigator.serviceWorker.getRegistration("./");
+          if(!offlineRegistration){
+            offlineRegistration=await navigator.serviceWorker.register("./service-worker.js",{scope:"./"});
+          }
+          await navigator.serviceWorker.ready;
+          enableButton();
+        }catch(error){
+          console.error("Falha ao preparar o armazenamento offline:",error);
+          status.textContent="Não foi possível ativar o modo offline. Recarregue a página com internet e tente novamente.";
+        }
+      })();
+
+      button.addEventListener("click",async()=>{
+        if(!offlineRegistration||button.disabled)return;
+        if(!navigator.onLine){
+          status.textContent="Conecte-se à internet para baixar os arquivos antes de sair para a feira.";
+          return;
+        }
+
+        button.disabled=true;
+        progress.hidden=false;
+        progress.value=0;
+        status.textContent="Verificando espaço disponível no navegador…";
+
+        try{
+          if(navigator.storage&&navigator.storage.estimate){
+            const estimate=await navigator.storage.estimate();
+            const available=(estimate.quota||0)-(estimate.usage||0);
+            const minimum=210*1024*1024;
+            if(available>0&&available<minimum){
+              throw new Error("Pouco espaço disponível no armazenamento do Chrome. Libere pelo menos 210 MB e tente novamente.");
+            }
+          }
+          let persistent=false;
+          if(navigator.storage&&navigator.storage.persist){
+            try{persistent=await navigator.storage.persist();}catch(_){}
+          }
+
+          const worker=offlineRegistration.active||navigator.serviceWorker.controller;
+          if(!worker)throw new Error("O armazenamento offline ainda está sendo ativado. Recarregue a página e tente novamente.");
+
+          await new Promise((resolve,reject)=>{
+            const channel=new MessageChannel();
+            channel.port1.onmessage=(event)=>{
+              const data=event.data||{};
+              if(data.type==="progress"){
+                progress.max=data.total;
+                progress.value=data.completed;
+                status.textContent="Baixando "+data.completed+" de "+data.total+": "+data.file;
+              }else if(data.type==="done"){
+                progress.value=progress.max;
+                status.textContent="Pronto! Todos os 37 recursos foram armazenados. "+(persistent?"O Chrome autorizou armazenamento persistente.":"Mantenha os dados do site no Chrome para preservar os arquivos offline.");
+                button.textContent="Versão offline preparada";
+                button.disabled=false;
+                button.dataset.completed="true";
+                resolve();
+              }else if(data.type==="error"){
+                reject(new Error(data.message||"Falha ao baixar os recursos."));
+              }
+            };
+            worker.postMessage({type:"PREPARE_OFFLINE"},[channel.port2]);
+          });
+        }catch(error){
+          console.error("Falha no download offline:",error);
+          status.textContent=error.message||"Não foi possível concluir o download offline. Tente novamente.";
+          button.disabled=false;
+        }
+      });
+    })();
   </script>
 </body>
 </html>
