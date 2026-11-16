@@ -17,7 +17,17 @@
   </script>
   <script>
     // Inicializar antes do A-Frame permite que ele detecte a compatibilidade Cardboard.
-    window.webxrPolyfill = new WebXRPolyfill({ cardboard: true });
+    window.webxrPolyfill = new WebXRPolyfill({
+      cardboard: true,
+      cardboardConfig: {
+        DPDB_URL: null,
+        DEFAULT_VIEWER: "CardboardV1",
+        MOBILE_WAKE_LOCK: true,
+        CARDBOARD_UI_DISABLED: false,
+        ROTATE_INSTRUCTIONS_DISABLED: false,
+        BUFFER_SCALE: 0.5
+      }
+    });
   </script>
   <script src="vendor/aframe.min.js"></script>
   <script>
