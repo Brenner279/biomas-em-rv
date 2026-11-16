@@ -87,9 +87,10 @@ jobs:
                 BUFFER_SCALE: 0.5
               }
             });"""
-          if old_init not in html:
-              raise SystemExit("A inicialização padrão do WebXR Polyfill não foi encontrada.")
-          html = html.replace(old_init, new_init)
+          if old_init in html:
+              html = html.replace(old_init, new_init)
+          elif "new WebXRPolyfill({" not in html or "DPDB_URL: null" not in html:
+              raise SystemExit("A configuração offline do WebXR Polyfill não foi encontrada.")
 
           # Fontes externas são opcionais; removê-las mantém a experiência sem rede.
           html = "\n".join(
