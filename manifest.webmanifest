@@ -1,0 +1,21 @@
+{
+  "id": "./",
+  "name": "Brasil Imersivo — Realidade Virtual",
+  "short_name": "Brasil Imersivo",
+  "description": "Explore os seis biomas brasileiros em realidade virtual.",
+  "lang": "pt-BR",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#0b5734",
+  "theme_color": "#0b5734",
+  "icons": [
+    {
+      "src": "assets/offline-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
