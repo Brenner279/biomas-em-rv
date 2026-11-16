@@ -43,7 +43,7 @@ jobs:
       - name: Montar experiência A-Frame VR para uso offline
         run: |
           mkdir -p www/vendor www/assets
-          cp index.html style.css www/
+          cp index.html style.css service-worker.js manifest.webmanifest www/
           cp ./*.png ./*.mp3 ./*.mp4 www/
           cp -R assets/. www/assets/
 
@@ -52,6 +52,9 @@ jobs:
           curl -fL --retry 3 https://cdn.jsdelivr.net/npm/webxr-polyfill@2.0.3/build/webxr-polyfill.min.js -o www/vendor/webxr-polyfill.min.js
           test -s www/vendor/aframe.min.js
           test -s www/vendor/webxr-polyfill.min.js
+          test -s www/service-worker.js
+          test -s www/manifest.webmanifest
+          test -s www/assets/offline-icon.svg
 
           python3 - <<'PY'
           from pathlib import Path
